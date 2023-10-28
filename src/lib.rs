@@ -1,53 +1,77 @@
 #![no_std]
-use asr::{signature::Signature, timer, timer::TimerState, watcher::Watcher, Address, Process, time::Duration};
+#![feature(type_alias_impl_trait, const_async_blocks)]
+#![warn(
+    clippy::complexity,
+    clippy::correctness,
+    clippy::perf,
+    clippy::style,
+    clippy::undocumented_unsafe_blocks,
+    rust_2018_idioms
+)]
 
-#[cfg(all(not(test), target_arch = "wasm32"))]
-#[panic_handler]
-fn panic(_: &core::panic::PanicInfo) -> ! {
-    core::arch::wasm32::unreachable()
+use asr::{
+    file_format::pe,
+    future::{next_tick, retry},
+    settings::Gui,
+    signature::Signature,
+    timer::{self, TimerState},
+    watcher::Watcher,
+    Address, Address32, Process,
+};
+
+asr::panic_handler!();
+asr::async_main!(nightly);
+
+const PROCESS_NAMES: &[&str] = &["SonicForever.exe"];
+
+async fn main() {
+    let mut settings = Settings::register();
+
+    loop {
+        // Hook to the target process
+        let process = retry(|| PROCESS_NAMES.iter().find_map(|&name| Process::attach(name))).await;
+
+        process
+            .until_closes(async {
+                // Once the target has been found and attached to, set up some default watchers
+                let mut watchers = Watchers::default();
+
+                // Perform memory scanning to look for the addresses we need
+                let addresses = Addresses::init(&process).await;
+
+                loop {
+                    // Splitting logic. Adapted from OG LiveSplit:
+                    // Order of execution
+                    // 1. update() will always be run first. There are no conditions on the execution of this action.
+                    // 2. If the timer is currently either running or paused, then the isLoading, gameTime, and reset actions will be run.
+                    // 3. If reset does not return true, then the split action will be run.
+                    // 4. If the timer is currently not running (and not paused), then the start action will be run.
+                    settings.update();
+                    update_loop(&process, &addresses, &mut watchers);
+
+                    let timer_state = timer::state();
+                    if timer_state == TimerState::Running || timer_state == TimerState::Paused {
+                        if reset(&watchers, &settings, &addresses) {
+                            timer::reset()
+                        } else if split(&watchers, &settings) {
+                            timer::split()
+                        }
+                    }
+
+                    if timer::state() == TimerState::NotRunning
+                        && start(&watchers, &settings, &addresses)
+                    {
+                        timer::start();
+                    }
+
+                    next_tick().await;
+                }
+            })
+            .await;
+    }
 }
 
-static AUTOSPLITTER: spinning_top::Spinlock<State> = spinning_top::const_spinlock(State {
-    game: None,
-    watchers: Watchers {
-        state: Watcher::new(),
-        levelid: Watcher::new(),
-        zoneselectongamecomplete: Watcher::new(),
-        zoneindicator: Watcher::new(),
-    },
-    settings: None,
-});
-
-struct State {
-    game: Option<ProcessInfo>,
-    watchers: Watchers,
-    settings: Option<Settings>,
-}
-
-struct ProcessInfo {
-    game: Process,
-    is_64_bit: bool,
-    game_version: GameVersion,
-    main_module_base: Address,
-    main_module_size: u64,
-    addresses: Option<MemoryPtr>,
-}
-
-struct Watchers {
-    state: Watcher<u8>,
-    levelid: Watcher<Acts>,
-    zoneselectongamecomplete: Watcher<u8>,
-    zoneindicator: Watcher<ZoneIndicator>,
-}
-
-struct MemoryPtr {
-    state: Address,
-    levelid: Address,
-    zoneselectongamecomplete: Address,
-    zoneindicator: Address,
-}
-
-#[derive(asr::Settings)]
+#[derive(asr::settings::Gui)]
 struct Settings {
     #[default = true]
     /// Start --> New Game
@@ -117,357 +141,301 @@ struct Settings {
     final_zone: bool,
 }
 
-impl ProcessInfo {
-    pub fn attach_process() -> Option<Self> {
-        const PROCESS_NAMES: [&str; 1] = ["SonicForever.exe"];
-        let mut proc: Option<Process> = None;
-        let mut proc_name: Option<&str> = None;
-    
-        for name in PROCESS_NAMES {
-            proc = Process::attach(name);
-            if proc.is_some() {
-                proc_name = Some(name);
-                break;
-            }
-        }
-    
-        let game = proc?;
-        let main_module_base = game.get_module_address(proc_name?).ok()?;
-        let main_module_size: u64 = game.get_module_size(proc_name?).ok()?;
+#[derive(Default)]
+struct Watchers {
+    state: Watcher<u8>,
+    levelid: Watcher<Acts>,
+    zoneselectongamecomplete: Watcher<u8>,
+    zoneindicator: Watcher<ZoneIndicator>,
+}
 
-        // Determine game version through hacky ways
-        const SIG64: Signature<15> = Signature::new("81 F9 ???????? 0F 87 ???????? 41 8B 8C");
-        const SIG32: Signature<19> = Signature::new("3D ???????? 0F 87 ???????? FF 24 85 ???????? A1");
-        
-        let is_64_bit = if let Some(_is64bit) = SIG64.scan_process_range(&game, main_module_base, main_module_size) {
-            true
-        } else if let Some(_is32bit) = SIG32.scan_process_range(&game, main_module_base, main_module_size) {
-            false
-        } else {
-            return None
-        };
+struct Addresses {
+    state: Address,
+    levelid: Address,
+    zoneselectongamecomplete: Address,
+    zoneindicator: Address,
+    game_version: GameVersion,
+}
 
-        let game_version = if is_64_bit {
-            GameVersion::Below1_5_0
-        } else {
-            if main_module_size < 0x57F4000 as u64 {
-                GameVersion::Below1_5_0
-            } else {
-                GameVersion::V1_5_0OrHigher
-            }
-        };
-   
-        Some(Self {
-            game,
-            is_64_bit,
-            game_version,
-            main_module_base,
-            main_module_size,
-            addresses: None,
+impl Addresses {
+    async fn init(process: &Process) -> Self {
+        let main_module_base = retry(|| {
+            PROCESS_NAMES
+                .iter()
+                .find_map(|&name| process.get_module_address(name).ok())
         })
-    }
-}
+        .await;
+        let main_module_size =
+            retry(|| pe::read_size_of_image(process, main_module_base)).await as u64;
+        let main_module = (main_module_base, main_module_size);
 
-impl State {
-    fn init(&mut self) -> bool {        
-        if self.game.is_none() {
-            self.game = ProcessInfo::attach_process()
-        }
+        let is_64_bit = retry(|| pe::MachineType::read(process, main_module_base)).await
+            == pe::MachineType::X86_64;
 
-        let Some(game) = &mut self.game else {
-            return false
-        };
-
-        if !game.game.is_open() {
-            self.game = None;
-            return false
-        }
-
-        if game.addresses.is_none() {
-            game.addresses = MemoryPtr::new(&game.game, game.main_module_base, game.main_module_size, game.is_64_bit, game.game_version)
-        }
-
-        game.addresses.is_some()   
-    }
-
-    fn update(&mut self) {
-        let Some(game) = &self.game else { return };
-        let Some(addresses) = &game.addresses else { return };
-        let proc = &game.game;
-
-        let Some(_thing) = self.watchers.state.update(proc.read(addresses.state).ok()) else { return };
-        let Some(_thing) = self.watchers.zoneselectongamecomplete.update(if game.game_version == GameVersion::V1_5_0OrHigher { proc.read(addresses.zoneselectongamecomplete).ok() } else  { Some(0) }) else { return };
-
-        let Some(g) = proc.read::<u32>(addresses.zoneindicator).ok() else { return };
-        let i: ZoneIndicator = match &g {
-            0x6E69614D => ZoneIndicator::MainMenu,
-            0x656E6F5A => ZoneIndicator::Zones,
-            0x69646E45 => ZoneIndicator::Ending,
-            0x65766153 => ZoneIndicator::SaveSelect,
-            _ => ZoneIndicator::Default
-        };
-        let Some(zone) = self.watchers.zoneindicator.update(Some(i)) else { return };
-
-        if zone.current == ZoneIndicator::Ending {
-            self.watchers.levelid.update(Some(Acts::Default));
-        } else if zone.current == ZoneIndicator::Zones {
-            let Some(g) = proc.read::<u8>(addresses.levelid).ok() else { return };
-            let i: Acts = match g {
-                0 => Acts::GreenHill1,
-                1 => Acts::GreenHill2,
-                2 => Acts::GreenHill3,
-                3 => Acts::Marble1,
-                4 => Acts::Marble2,
-                5 => Acts::Marble3,
-                6 => Acts::SpringYard1,
-                7 => Acts::SpringYard2,
-                8 => Acts::SpringYard3,
-                9 => Acts::Labyrinth1,
-                10 => Acts::Labyrinth2,
-                11 => Acts::Labyrinth3,
-                12 => Acts::StarLight1,
-                13 => Acts::StarLight2,
-                14 => Acts::StarLight3,
-                15 => Acts::ScrapBrain1,
-                16 => Acts::ScrapBrain2,
-                17 => Acts::ScrapBrain3,
-                18 => Acts::FinalZone,
-                _ => Acts::Default,
-            };
-            self.watchers.levelid.update(Some(i));
-        } else {
-            let Some(x) = &self.watchers.levelid.pair else { return };
-            let x = x.current;
-            self.watchers.levelid.update(Some(x));
-        }
-    }
-
-    fn start(&mut self) -> bool {
-        let Some(game) = &self.game else { return false };
-        let Some(state) = &self.watchers.state.pair else { return false };
-        let Some(zoneselectongamecomplete) = &self.watchers.zoneselectongamecomplete.pair else { return false };
-        let Some(zoneindicator) = &self.watchers.zoneindicator.pair else { return false };
-        let Some(settings) = &self.settings else { return false };
-
-        if game.game_version == GameVersion::Below1_5_0 {
-            let run_started_save_file = state.changed() && state.current == 2 && zoneindicator.current == ZoneIndicator::SaveSelect;
-            let run_started_no_save_file = state.old == 6 && state.current == 7;
-            let run_started_ngp = state.old == 8 && state.current == 9;
-
-            (settings.start_clean_save && (run_started_save_file || run_started_no_save_file)) || (settings.start_new_game_plus && run_started_ngp) 
-        } else {
-            let run_started_save_file = state.old == 3 && state.current == 7 && zoneindicator.current == ZoneIndicator::SaveSelect;
-            let run_started_no_save_file = state.old == 10 && state.current == 11;
-            let run_started_ngp = state.old == 2 && state.current == 6 && zoneselectongamecomplete.current == 0;
-
-            (settings.start_clean_save && (run_started_save_file || run_started_no_save_file)) || (settings.start_new_game_plus && run_started_ngp) 
-        }
-    }
-
-    fn split(&mut self) -> bool {
-        let Some(levelid) = &self.watchers.levelid.pair else { return false };
-        let Some(settings) = &self.settings else { return false };
-    
-        match levelid.current {
-            Acts::GreenHill2 => settings.green_hill_1 && levelid.old == Acts::GreenHill1,
-            Acts::GreenHill3 => settings.green_hill_2 && levelid.old == Acts::GreenHill2,
-            Acts::Marble1 => settings.green_hill_3 && levelid.old == Acts::GreenHill3,
-            Acts::Marble2 => settings.marble_1 && levelid.old == Acts::Marble1,
-            Acts::Marble3 => settings.marble_2 && levelid.old == Acts::Marble2,
-            Acts::SpringYard1 => settings.marble_3 && levelid.old == Acts::Marble3,
-            Acts::SpringYard2 => settings.spring_yard_1 && levelid.old == Acts::SpringYard1,
-            Acts::SpringYard3 => settings.spring_yard_2 && levelid.old == Acts::SpringYard2,
-            Acts::Labyrinth1 => settings.spring_yard_3 && levelid.old == Acts::SpringYard3,
-            Acts::Labyrinth2 => settings.labyrinth_1 && levelid.old == Acts::Labyrinth1,
-            Acts::Labyrinth3 => settings.labyrinth_2 && levelid.old == Acts::Labyrinth2,
-            Acts::StarLight1 => settings.labyrinth_3 && levelid.old == Acts::Labyrinth3,
-            Acts::StarLight2 => settings.star_light_1 && levelid.old == Acts::StarLight1,
-            Acts::StarLight3 => settings.star_light_2 && levelid.old == Acts::StarLight2,
-            Acts::ScrapBrain1 => settings.star_light_3 && levelid.old == Acts::StarLight3,
-            Acts::ScrapBrain2 => settings.scrap_brain_1 && levelid.old == Acts::ScrapBrain1,
-            Acts::ScrapBrain3 => settings.scrap_brain_2 && levelid.old == Acts::ScrapBrain2,
-            Acts::FinalZone => settings.scrap_brain_3 && levelid.old == Acts::ScrapBrain3,
-            Acts::Default => settings.final_zone && levelid.old != levelid.current,
-            _ => false,
-        }
-    }
-
-    fn reset(&mut self) -> bool {
-        let Some(settings) = &self.settings else { return false };
-        
-        if !settings.reset {
-            return false
-        }
-
-        let Some(state) = &self.watchers.state.pair else { return false };
-        let Some(zoneindicator) = &self.watchers.zoneindicator.pair else { return false };
-        let Some(game) = &self.game else { return false };
-
-        if game.game_version == GameVersion::Below1_5_0 {
-            state.current == 201 && state.old == 200 && zoneindicator.current == ZoneIndicator::SaveSelect
-        } else {
-            state.current == 14 && state.old == 13 && zoneindicator.current == ZoneIndicator::SaveSelect
-        }
-    }
-
-    fn is_loading(&mut self) -> Option<bool> {
-        None
-    }
-
-    fn game_time(&mut self) -> Option<Duration> {
-        None
-    }
-}
-
-impl MemoryPtr {
-    fn new(process: &Process, addr: Address, size: u64, is_64_bit: bool, version: GameVersion) -> Option<Self> {
-        fn pointerpath(process: &Process, base_address: Address, ptr: Address, lea: Address, offset1: u32, offset2: u32, offset3: u32, absolute: bool, is_64_bit: bool) -> Option<Address> {
-            if is_64_bit {
-                if offset1 == 0 {
-                    return Some(lea + offset3)
-                }
-
-                let temp_offset = process.read::<u32>(ptr + offset1).ok()?;
-                let temp_offset_2 = base_address + temp_offset + offset2;
-
-                if absolute {
-                    Some(base_address + process.read::<u32>(temp_offset_2).ok()? + offset3)
+        let game_version = match is_64_bit {
+            true => GameVersion::Below1_5_0,
+            false => {
+                if main_module_size < 0x57F4000 {
+                    GameVersion::Below1_5_0
                 } else {
-                    Some(temp_offset_2 + 0x4 as u32 + process.read::<u32>(temp_offset_2).ok()? + offset3)
+                    GameVersion::V1_5_0OrHigher
                 }
-            } else {
-                let result = process.read_pointer_path32::<u32>(ptr.0 as u32, &[offset1, offset2]).ok()? as u64;
-                Some(Address(result + offset3 as u64))
             }
-        }
+        };
 
-        if version == GameVersion::Below1_5_0 {
-            if is_64_bit {
-                const SIG_64: Signature<15> = Signature::new("81 F9 ???????? 0F 87 ???????? 41 8B 8C");
-                let ptr = SIG_64.scan_process_range(process, addr, size)?.0 + 16;
-                let ptr = Address(addr.0 + process.read::<u32>(Address(ptr)).ok()? as u64);
+        let pointer_path = |ptr, lea, offset1, offset2, offset3, absolute| async move {
+            match is_64_bit {
+                true => match offset1 {
+                    0 => lea + offset3,
+                    _ => {
+                        let temp_offset = retry(|| process.read::<u32>(ptr + offset1).ok()).await;
+                        let temp_offset_2 = main_module_base + temp_offset + offset2;
 
-                const SIG_64_2: Signature<11> = Signature::new("48 8D 05 ???????? 49 63 F8 4C");
-                let lea = SIG_64_2.scan_process_range(process, addr, size)?.0 + 3;
-                let lea = Address(lea + 0x4 + process.read::<u32>(Address(lea)).ok()? as u64);
+                        match absolute {
+                            true => {
+                                main_module_base
+                                    + retry(|| process.read::<u32>(temp_offset_2)).await
+                                    + offset3
+                            }
+                            false => {
+                                temp_offset_2
+                                    + 0x4
+                                    + retry(|| process.read::<u32>(temp_offset_2)).await
+                                    + offset3
+                            }
+                        }
+                    }
+                },
+                false => {
+                    let result: Address = retry(|| {
+                        process.read_pointer_path32::<Address32>(ptr, &[offset1, offset2])
+                    })
+                    .await
+                    .into();
+                    result + offset3
+                }
+            }
+        };
 
-                let state = pointerpath(process, addr, ptr, lea, 0x4 * 0, 0, 0x9EC, false, is_64_bit)?;
-                let levelid = pointerpath(process, addr, ptr, lea, 0x4 * 123, 2, 0, false, is_64_bit)?;
-                let zoneselectongamecomplete = Address(0);
+        match game_version {
+            GameVersion::Below1_5_0 => match is_64_bit {
+                true => {
+                    const SIG_64: Signature<15> =
+                        Signature::new("81 F9 ???????? 0F 87 ???????? 41 8B 8C");
+                    let ptr = retry(|| SIG_64.scan_process_range(process, main_module)).await + 16;
+                    let ptr = main_module_base + retry(|| process.read::<u32>(ptr)).await;
 
-                const SIG_64_3: Signature<15> = Signature::new("C6 05 ???????? ?? E9 ???????? 48 8D 0D");
-                let ptr = SIG_64_3.scan_process_range(process, addr, size)?.0 + 2;
-                let zoneindicator = Address(ptr + 0x5 + process.read::<u32>(Address(ptr)).ok()? as u64);
+                    const SIG_64_2: Signature<11> = Signature::new("48 8D 05 ???????? 49 63 F8 4C");
+                    let lea = retry(|| SIG_64_2.scan_process_range(process, main_module)).await + 3;
+                    let lea = lea + 0x4 + retry(|| process.read::<u32>(lea)).await;
 
-                Some(Self {
-                    state,
-                    levelid,
-                    zoneselectongamecomplete,
-                    zoneindicator,
-                })
-            } else {
-                const SIG32: Signature<19> = Signature::new("3D ???????? 0F 87 ???????? FF 24 85 ???????? A1");
-                let ptr = SIG32.scan_process_range(process, addr, size)?.0 + 14;
-                let ptr = Address(process.read::<u32>(Address(ptr)).ok()? as u64);
-                
-                let lea = Address(0);
+                    let state = pointer_path(ptr, lea, 0, 0, 0x9EC, false).await;
+                    let levelid = pointer_path(ptr, lea, 0x4 * 123, 2, 0, false).await;
+                    let zoneselectongamecomplete = Address::NULL;
 
-                let state = pointerpath(process, addr, ptr, lea, 0x4 * 73, 8, 0x9D8, true, is_64_bit)?;
-                let levelid = pointerpath(process, addr, ptr, lea, 0x4 * 123, 1, 0, true, is_64_bit)?;
-                let zoneselectongamecomplete = Address(0);
+                    const SIG_64_3: Signature<15> =
+                        Signature::new("C6 05 ???????? ?? E9 ???????? 48 8D 0D");
+                    let ptr = retry(|| SIG_64_3.scan_process_range(process, main_module)).await + 2;
+                    let zoneindicator = ptr + 0x5 + retry(|| process.read::<u32>(ptr)).await;
+
+                    Self {
+                        state,
+                        levelid,
+                        zoneselectongamecomplete,
+                        zoneindicator,
+                        game_version,
+                    }
+                }
+                false => {
+                    const SIG32: Signature<19> =
+                        Signature::new("3D ???????? 0F 87 ???????? FF 24 85 ???????? A1");
+                    let ptr = retry(|| SIG32.scan_process_range(process, main_module)).await + 14;
+                    let ptr: Address = retry(|| process.read::<Address32>(ptr)).await.into();
+
+                    let lea = Address::NULL;
+
+                    let state = pointer_path(ptr, lea, 0x4 * 73, 8, 0x9D8, true).await;
+                    let levelid = pointer_path(ptr, lea, 0x4 * 123, 1, 0, true).await;
+                    let zoneselectongamecomplete = Address::NULL;
+
+                    const SIG32_2: Signature<7> = Signature::new("69 F8 ???????? B8");
+                    let ptr = retry(|| SIG32_2.scan_process_range(process, main_module)).await + 7;
+                    let zoneindicator = retry(|| process.read::<Address32>(ptr)).await.into();
+
+                    Self {
+                        state,
+                        levelid,
+                        zoneselectongamecomplete,
+                        zoneindicator,
+                        game_version,
+                    }
+                }
+            },
+            GameVersion::V1_5_0OrHigher => {
+                const SIG32: Signature<19> =
+                    Signature::new("3D ???????? 0F 87 ???????? FF 24 85 ???????? A1");
+                let ptr = retry(|| SIG32.scan_process_range(process, main_module)).await + 14;
+                let ptr: Address = retry(|| process.read::<Address32>(ptr)).await.into();
+                let lea = Address::NULL;
+
+                let state = pointer_path(ptr, lea, 0x4 * 30, 8, 0x9D8, true).await;
+                let levelid = pointer_path(ptr, lea, 0x4 * 123, 1, 0, true).await;
+                let zoneselectongamecomplete = pointer_path(ptr, lea, 0x4 * 18, 3, 4, true).await;
 
                 const SIG32_2: Signature<7> = Signature::new("69 F8 ???????? B8");
-                let ptr = SIG32_2.scan_process_range(process, addr, size)?.0 + 7;
-                let zoneindicator = Address(process.read::<u32>(Address(ptr)).ok()? as u64);
+                let ptr = retry(|| SIG32_2.scan_process_range(process, main_module)).await + 7;
+                let zoneindicator = retry(|| process.read::<Address32>(ptr)).await.into();
 
-                Some(Self {
+                Self {
                     state,
                     levelid,
                     zoneselectongamecomplete,
                     zoneindicator,
-                })
-            }
-        } else {
-            if is_64_bit {
-                None
-            } else {
-                const SIG32: Signature<19> = Signature::new("3D ???????? 0F 87 ???????? FF 24 85 ???????? A1");
-                let ptr = SIG32.scan_process_range(process, addr, size)?.0 + 14;
-                let ptr = Address(process.read::<u32>(Address(ptr)).ok()? as u64);
-                let lea = Address(0);
-
-                let state = pointerpath(process, addr, ptr, lea, 0x4 * 30, 8, 0x9D8, true, is_64_bit)?;
-                let levelid = pointerpath(process, addr, ptr, lea, 0x4 * 123, 1, 0, true, is_64_bit)?;
-                let zoneselectongamecomplete = pointerpath(process, addr, ptr, lea, 0x4 * 18, 3, 4, true, is_64_bit)?;
-
-                const SIG32_2: Signature<7> = Signature::new("69 F8 ???????? B8");
-                let ptr = SIG32_2.scan_process_range(process, addr, size)?.0 + 7;
-                let zoneindicator = Address(process.read::<u32>(Address(ptr)).ok()? as u64);
-
-                Some(Self {
-                    state,
-                    levelid,
-                    zoneselectongamecomplete,
-                    zoneindicator,
-                })
+                    game_version,
+                }
             }
         }
     }
 }
 
-#[no_mangle]
-pub extern "C" fn update() {
-    // Get access to the spinlock
-    let autosplitter = &mut AUTOSPLITTER.lock();
-    
-    // Sets up the settings
-    autosplitter.settings.get_or_insert_with(Settings::register);
+fn update_loop(game: &Process, addresses: &Addresses, watchers: &mut Watchers) {
+    watchers
+        .state
+        .update_infallible(game.read(addresses.state).unwrap_or_default());
+    watchers
+        .zoneselectongamecomplete
+        .update_infallible(match addresses.game_version {
+            GameVersion::V1_5_0OrHigher => game
+                .read(addresses.zoneselectongamecomplete)
+                .unwrap_or_default(),
+            _ => 0,
+        });
 
-    // Main autosplitter logic, essentially refactored from the OG LivaSplit autosplitting component.
-    // First of all, the autosplitter needs to check if we managed to attach to the target process,
-    // otherwise there's no need to proceed further.
-    if !autosplitter.init() {
-        return
-    }
+    let zone =
+        watchers
+            .zoneindicator
+            .update_infallible(match game.read::<u32>(addresses.zoneindicator) {
+                Ok(0x6E69614D) => ZoneIndicator::MainMenu,
+                Ok(0x656E6F5A) => ZoneIndicator::Zones,
+                Ok(0x69646E45) => ZoneIndicator::Ending,
+                Ok(0x65766153) => ZoneIndicator::SaveSelect,
+                _ => ZoneIndicator::Default,
+            });
 
-    // The main update logic is launched with this
-    autosplitter.update();
-
-    let timer_state = timer::state();
-
-    // Splitting logic. Adapted from OG LiveSplit:
-    // Order of execution
-    // 1. update() [this is launched above] will always be run first. There are no conditions on the execution of this action.
-    // 2. If the timer is currently either running or paused, then the isLoading, gameTime, and reset actions will be run.
-    // 3. If reset does not return true, then the split action will be run.
-    // 4. If the timer is currently not running (and not paused), then the start action will be run.
-    if timer_state == TimerState::Running || timer_state == TimerState::Paused {
-        if let Some(is_loading) = autosplitter.is_loading() {
-            if is_loading {
-                timer::pause_game_time()
-            } else {
-                timer::resume_game_time()
-            }
-        }
-
-        if let Some(game_time) = autosplitter.game_time() {
-            timer::set_game_time(game_time)
-        }
-
-        if autosplitter.reset() {
-            timer::reset()
-        } else if autosplitter.split() {
-            timer::split()
-        }
-    } 
-
-    if timer_state == TimerState::NotRunning {
-        if autosplitter.start() {
-            timer::start()
-        }
-    }     
+    watchers.levelid.update_infallible(match zone.current {
+        ZoneIndicator::Ending => Acts::Default,
+        ZoneIndicator::Zones => match game.read::<u8>(addresses.levelid) {
+            Ok(0) => Acts::GreenHill1,
+            Ok(1) => Acts::GreenHill2,
+            Ok(2) => Acts::GreenHill3,
+            Ok(3) => Acts::Marble1,
+            Ok(4) => Acts::Marble2,
+            Ok(5) => Acts::Marble3,
+            Ok(6) => Acts::SpringYard1,
+            Ok(7) => Acts::SpringYard2,
+            Ok(8) => Acts::SpringYard3,
+            Ok(9) => Acts::Labyrinth1,
+            Ok(10) => Acts::Labyrinth2,
+            Ok(11) => Acts::Labyrinth3,
+            Ok(12) => Acts::StarLight1,
+            Ok(13) => Acts::StarLight2,
+            Ok(14) => Acts::StarLight3,
+            Ok(15) => Acts::ScrapBrain1,
+            Ok(16) => Acts::ScrapBrain2,
+            Ok(17) => Acts::ScrapBrain3,
+            Ok(18) => Acts::FinalZone,
+            _ => Acts::Default,
+        },
+        _ => match &watchers.levelid.pair {
+            Some(x) => x.current,
+            _ => Acts::Default,
+        },
+    });
 }
 
+fn start(watchers: &Watchers, settings: &Settings, addresses: &Addresses) -> bool {
+    let Some(state) = &watchers.state.pair else {
+        return false;
+    };
+    let Some(zoneselectongamecomplete) = &watchers.zoneselectongamecomplete.pair else {
+        return false;
+    };
+    let Some(zoneindicator) = &watchers.zoneindicator.pair else {
+        return false;
+    };
+
+    if addresses.game_version == GameVersion::Below1_5_0 {
+        let run_started_save_file = state.changed()
+            && state.current == 2
+            && zoneindicator.current == ZoneIndicator::SaveSelect;
+        let run_started_no_save_file = state.old == 6 && state.current == 7;
+        let run_started_ngp = state.old == 8 && state.current == 9;
+
+        (settings.start_clean_save && (run_started_save_file || run_started_no_save_file))
+            || (settings.start_new_game_plus && run_started_ngp)
+    } else {
+        let run_started_save_file = state.old == 3
+            && state.current == 7
+            && zoneindicator.current == ZoneIndicator::SaveSelect;
+        let run_started_no_save_file = state.old == 10 && state.current == 11;
+        let run_started_ngp =
+            state.old == 2 && state.current == 6 && zoneselectongamecomplete.current == 0;
+
+        (settings.start_clean_save && (run_started_save_file || run_started_no_save_file))
+            || (settings.start_new_game_plus && run_started_ngp)
+    }
+}
+
+fn split(watchers: &Watchers, settings: &Settings) -> bool {
+    watchers.levelid.pair.is_some_and(|levelid| match levelid.current {
+        Acts::GreenHill2 => settings.green_hill_1 && levelid.old == Acts::GreenHill1,
+        Acts::GreenHill3 => settings.green_hill_2 && levelid.old == Acts::GreenHill2,
+        Acts::Marble1 => settings.green_hill_3 && levelid.old == Acts::GreenHill3,
+        Acts::Marble2 => settings.marble_1 && levelid.old == Acts::Marble1,
+        Acts::Marble3 => settings.marble_2 && levelid.old == Acts::Marble2,
+        Acts::SpringYard1 => settings.marble_3 && levelid.old == Acts::Marble3,
+        Acts::SpringYard2 => settings.spring_yard_1 && levelid.old == Acts::SpringYard1,
+        Acts::SpringYard3 => settings.spring_yard_2 && levelid.old == Acts::SpringYard2,
+        Acts::Labyrinth1 => settings.spring_yard_3 && levelid.old == Acts::SpringYard3,
+        Acts::Labyrinth2 => settings.labyrinth_1 && levelid.old == Acts::Labyrinth1,
+        Acts::Labyrinth3 => settings.labyrinth_2 && levelid.old == Acts::Labyrinth2,
+        Acts::StarLight1 => settings.labyrinth_3 && levelid.old == Acts::Labyrinth3,
+        Acts::StarLight2 => settings.star_light_1 && levelid.old == Acts::StarLight1,
+        Acts::StarLight3 => settings.star_light_2 && levelid.old == Acts::StarLight2,
+        Acts::ScrapBrain1 => settings.star_light_3 && levelid.old == Acts::StarLight3,
+        Acts::ScrapBrain2 => settings.scrap_brain_1 && levelid.old == Acts::ScrapBrain1,
+        Acts::ScrapBrain3 => settings.scrap_brain_2 && levelid.old == Acts::ScrapBrain2,
+        Acts::FinalZone => settings.scrap_brain_3 && levelid.old == Acts::ScrapBrain3,
+        Acts::Default => settings.final_zone && levelid.old != levelid.current,
+        _ => false,
+    })
+}
+
+fn reset(watchers: &Watchers, settings: &Settings, addresses: &Addresses) -> bool {
+    settings.reset
+        && match addresses.game_version {
+            GameVersion::Below1_5_0 => {
+                watchers
+                    .state
+                    .pair
+                    .is_some_and(|val| val.changed_from_to(&200, &201))
+                    && watchers
+                        .zoneindicator
+                        .pair
+                        .is_some_and(|val| val.current == ZoneIndicator::SaveSelect)
+            }
+            _ => {
+                watchers
+                    .state
+                    .pair
+                    .is_some_and(|val| val.changed_from_to(&13, &14))
+                    && watchers
+                        .zoneindicator
+                        .pair
+                        .is_some_and(|val| val.current == ZoneIndicator::SaveSelect)
+            }
+        }
+}
 
 #[derive(Clone, Copy, PartialEq)]
 enum ZoneIndicator {
@@ -507,11 +475,3 @@ enum GameVersion {
     Below1_5_0,
     V1_5_0OrHigher,
 }
-
-/*
-    enum GameVersionSize {
-        v_1_5_0_32 = 0x57F4000,
-        v_1_3_4_32 = 0x3623000,
-        v_1_2_1_32 = 0x362B000,
-    }
-*/
